@@ -1,95 +1,126 @@
 # ImageShield Desktop
 
-ImageShield is a self-contained, offline desktop build of the local EditShield
-VAE protection prototype. End users install the application, launch it from an
-icon, upload an image, and download a protected PNG. They do not need Python,
-Conda, a terminal, an account, or an internet connection.
+ImageShield is an offline desktop application for applying the local EditShield
+VAE protection prototype to an uploaded image. End users install a DMG, launch
+ImageShield from an icon, and use a local browser interface. They do not need
+Python, Conda, a terminal, an account, or internet access.
 
-This folder is intentionally independent from the research scripts in its
-parent directory.
+Developers building the DMG need internet once to install Python dependencies
+and download the pinned model files from their original Hugging Face repository.
+The completed DMG contains those files and runs offline.
 
-## Included Components
+## Build a DMG from a Clean Clone
 
-```text
-ImageShield/
-  app.py                         desktop entry point
-  imageshield/
-    protection.py                offline model and PGD service
-    resources.py                 source/bundle/user-data paths
-    ui.py                        Gradio interface
-  models/instruct-pix2pix/
-    vae/                         bundled VAE configuration and weights
-    scheduler/                   bundled scheduler configuration
-  ImageShield.spec               PyInstaller build definition
-  packaging/
-    macos/                       signing entitlements
-    windows/                     Inno Setup installer definition
-  scripts/                       validation and platform build scripts
-  tests/                         tests that do not load the real checkpoint
-```
+Requirements:
 
-The bundled model files are loaded with `local_files_only=True`. The application
-does not fall back to downloading weights.
-
-## Development
-
-Use Python 3.10 in a dedicated environment:
+- An Apple Silicon Mac
+- macOS 12 or newer
+- Python 3.10
+- Internet access during setup
+- Several gigabytes of free disk space
 
 ```bash
+git clone https://github.com/SabrinaYyy/ImageShield_dmg.git
+cd ImageShield_dmg
+
 python3.10 -m venv .venv
 source .venv/bin/activate
+
 python -m pip install --upgrade pip
 python -m pip install -r requirements-build.txt
-python scripts/validate_bundle.py
-pytest
-python app.py
-```
 
-On Windows, activate the environment with:
-
-```powershell
-.venv\Scripts\Activate.ps1
-```
-
-The Gradio server binds only to `127.0.0.1`, sharing is disabled, and uploaded
-images are processed locally. Generated downloads are stored under the user's
-application-data directory and files older than 24 hours are removed at the
-next launch.
-
-The main screen provides:
-
-- Resolution choices of 128, 256, or 512 pixels.
-- An optimization-step slider from 20 to 100 in increments of 10.
-- A Stop button that requests cancellation between optimization steps.
-
-The default is 256 pixels and 20 steps for a more practical desktop runtime.
-Stopping is cooperative: the current VAE operation must finish before the job
-can exit, so the response is not always instantaneous. If the application does
-not respond, quit ImageShield from the Dock or use macOS Force Quit.
-
-Developers and automated tests can override that location with the
-`IMAGESHIELD_DATA_DIR` environment variable. Set `IMAGESHIELD_OPEN_BROWSER=0`
-to start the local server without opening a browser. Set
-`IMAGESHIELD_SMOKE_TEST=1` to load the bundled model, run a one-step protection
-on a generated test image, and exit.
-
-## Build macOS
-
-Build macOS releases on macOS. The current development machine is Apple Silicon,
-so its build targets Apple Silicon unless a separate architecture strategy is
-configured.
-
-```bash
-chmod +x scripts/build_macos.sh
+chmod +x scripts/download_model.sh scripts/build_macos.sh
+./scripts/download_model.sh
 ./scripts/build_macos.sh
 ```
 
-Development output:
+The finished installer is:
 
 ```text
-dist/ImageShield.app
 dist/dmg/ImageShield.dmg
 ```
+
+The first build can take several minutes. PyInstaller packages Python, Gradio,
+PyTorch, the application, and the downloaded model into one offline app.
+
+## Model Download
+
+`scripts/download_model.sh` downloads only the VAE and scheduler files required
+by ImageShield:
+
+```text
+models/instruct-pix2pix/
+  vae/config.json
+  vae/diffusion_pytorch_model.safetensors
+  scheduler/scheduler_config.json
+```
+
+The download is pinned to:
+
+```text
+Repository: timbrooks/instruct-pix2pix
+Revision:   31519b5cb02a7fd89b906d88731cd4d6a7bbf88d
+```
+
+Pinning the revision ensures that every developer builds with the same model
+files. Downloaded model files are ignored by Git and should not be committed.
+
+The application itself uses `local_files_only=True`. Running `python app.py`
+does not download a missing model. Run `./scripts/download_model.sh` first.
+
+## Run from Source
+
+After completing the environment and model-download steps:
+
+```bash
+python scripts/validate_bundle.py
+python -m pytest
+python app.py
+```
+
+The interface opens locally at `127.0.0.1`. Gradio sharing is disabled.
+
+The main screen includes:
+
+- Resolution choices of 128, 256, or 512 pixels
+- An optimization-step slider from 20 to 100
+- A Stop button that requests cancellation between optimization steps
+
+The default is 256 pixels and 20 steps. Higher settings can take dramatically
+longer. Stopping is cooperative, so the current model operation must finish
+before cancellation takes effect.
+
+## Repository Structure
+
+```text
+ImageShield/
+  app.py
+  ImageShield.spec
+  requirements.txt
+  requirements-build.txt
+  imageshield/
+    protection.py
+    resources.py
+    ui.py
+  models/
+    .gitkeep
+  packaging/
+    macos/
+    windows/
+  scripts/
+    download_model.sh
+    build_macos.sh
+    build_windows.ps1
+    validate_bundle.py
+  tests/
+  licenses/
+```
+
+## macOS Signing
+
+Without an Apple signing identity, `build_macos.sh` creates an unsigned
+development DMG. Another Apple Silicon Mac may require the user to right-click
+ImageShield and choose **Open**.
 
 For a signed build:
 
@@ -98,74 +129,58 @@ export APPLE_SIGNING_IDENTITY="Developer ID Application: Organization (TEAMID)"
 ./scripts/build_macos.sh
 ```
 
-Signing alone is not sufficient for public distribution. Submit the DMG for
-Apple notarization and staple the notarization result before release.
+A public release should also be notarized and stapled using an Apple Developer
+account.
 
-## Build Windows
+## Windows Build
 
-Build Windows releases on a Windows machine. PyInstaller does not cross-compile
-the macOS build into a Windows executable.
+Windows releases must be built on Windows:
 
 ```powershell
 py -3.10 -m venv .venv
 .venv\Scripts\Activate.ps1
 python -m pip install --upgrade pip
 python -m pip install -r requirements-build.txt
+```
+
+Download the same pinned model files into `models\instruct-pix2pix`, then run:
+
+```powershell
 .\scripts\build_windows.ps1
 ```
 
-This creates:
+The PyInstaller output is `dist\ImageShield\ImageShield.exe`. Compile
+`packaging\windows\ImageShield.iss` with Inno Setup to create the installer.
 
-```text
-dist\ImageShield\ImageShield.exe
-```
+## Privacy and Storage
 
-Install Inno Setup, open `packaging\windows\ImageShield.iss`, and compile it to
-create `dist\installer\ImageShield-Setup-0.1.0.exe`. Sign both the executable and
-installer before public distribution.
+- Processing occurs on the user's computer.
+- The server binds only to `127.0.0.1`.
+- Public Gradio sharing is disabled.
+- Generated downloads are stored in the user's application-data directory.
+- Generated files older than 24 hours are removed during a later startup.
 
-## End-User Experience
-
-macOS:
-
-1. Download `ImageShield.dmg`.
-2. Open it and drag ImageShield into Applications.
-3. Open ImageShield from Applications.
-4. The local interface opens in the default browser.
-
-Windows:
-
-1. Download `ImageShield-Setup-0.1.0.exe`.
-2. Follow the installer.
-3. Open ImageShield from the Start menu or desktop shortcut.
-4. The local interface opens in the default browser.
-
-Closing the browser tab does not necessarily stop the desktop process. Users can
-quit ImageShield from the Dock, Task Manager, or operating-system application
-controls.
+Closing the browser tab does not necessarily stop ImageShield. Quit the
+application through the Dock or operating-system application controls.
 
 ## Release Checklist
 
-1. Confirm redistribution rights for the model checkpoint and all dependencies.
-2. Replace the placeholder notices in `licenses/` with authoritative license
-   texts and retain required attributions.
-3. Run `python scripts/validate_bundle.py` and `pytest`.
-4. Build on a clean machine for each target operating system and architecture.
-5. Test without Python installed and with networking disabled.
-6. Test model startup, image upload, protection, download, and application exit.
-7. Sign and notarize the macOS release.
-8. Sign the Windows executable and installer.
-9. Publish checksums for every released installer.
+1. Confirm redistribution rights for the model checkpoint and dependencies.
+2. Include authoritative third-party licenses and required attributions.
+3. Run `./scripts/download_model.sh`.
+4. Run `python scripts/validate_bundle.py` and `python -m pytest`.
+5. Build on a clean machine for each operating system and architecture.
+6. Test startup, protection, cancellation, and download with networking off.
+7. Sign and notarize macOS public releases.
+8. Sign Windows executables and installers.
+9. Publish a SHA-256 checksum for each installer.
 
 ## Product Limits
 
-- This implementation is the VAE latent-divergence protection path. It should
-  not be described as universal protection against every editing or face-swap
-  system.
-- Protection returns a center-cropped square PNG at the configured resolution.
-- CPU mode is supported but can be considerably slower than MPS or CUDA.
-- Only one protection job runs at a time to avoid exhausting accelerator memory.
-- Higher resolutions and step counts can take dramatically longer. Runtime
-  grows with both image area and the number of optimization steps.
-- The final installed size will be much larger than the 319 MB checkpoint
-  because it also includes PyTorch, Gradio, and their runtime dependencies.
+- This is the VAE latent-divergence protection path, not universal protection
+  against every image-editing or face-swap system.
+- Output is a center-cropped square PNG at the selected resolution.
+- CPU mode is supported but can be much slower than MPS or CUDA.
+- One protection job runs at a time to limit accelerator memory use.
+- The installed application is large because it contains PyTorch, Gradio, and
+  the model checkpoint.

@@ -15,7 +15,6 @@ from PIL import Image, ImageOps
 from torchvision import transforms
 
 from .resources import resource_path
-from .model_manager import get_models_dir, ensure_models_downloaded
 
 ProgressCallback = Callable[[float, str], None]
 CancelCallback = Callable[[], bool]
@@ -238,16 +237,7 @@ class ProtectionService:
         model_dir: Path | None = None,
         settings: ProtectionSettings | None = None,
     ) -> None:
-        if model_dir is None:
-            # Try bundled models first, fall back to managed models
-            bundled = resource_path("models", "instruct-pix2pix")
-            if bundled.exists() and (bundled / "vae" / "config.json").exists():
-                model_dir = bundled
-            else:
-                # Use model manager (will auto-download on first run)
-                model_dir = get_models_dir()
-        
-        self.model_dir = model_dir
+        self.model_dir = model_dir or resource_path("models", "instruct-pix2pix")
         self.settings = settings or ProtectionSettings()
         self.settings.validate()
         self.device, self.dtype = select_device()
@@ -256,7 +246,6 @@ class ProtectionService:
         self._load_lock = threading.Lock()
         self._protection_lock = threading.Lock()
         self._cancel_event = threading.Event()
-        self._models_ensured = False
 
     @property
     def is_loaded(self) -> bool:
@@ -280,12 +269,6 @@ class ProtectionService:
         with self._load_lock:
             if self.is_loaded:
                 return
-            
-            # Ensure models are available (download if needed)
-            if not self._models_ensured:
-                ensure_models_downloaded()
-                self._models_ensured = True
-            
             self.validate_model_files()
             from diffusers.models.autoencoders.autoencoder_kl import AutoencoderKL
             from diffusers.schedulers.scheduling_ddpm import DDPMScheduler

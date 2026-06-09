@@ -8,6 +8,6 @@ __pycache__/
 build/
 dist/
 *.spec.bak
-models/
-.env
-.env.local
+
+# Downloaded by scripts/download_model.sh. Do not commit model checkpoints.
+models/instruct-pix2pix/

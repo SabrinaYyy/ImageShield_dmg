@@ -5,7 +5,11 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
 export PYINSTALLER_CONFIG_DIR="$ROOT/.pyinstaller"
 
-python scripts/validate_bundle.py
+if ! python scripts/validate_bundle.py; then
+  echo
+  echo "Run ./scripts/download_model.sh, then run this build again." >&2
+  exit 1
+fi
 python -m PyInstaller --noconfirm --clean ImageShield.spec
 
 APP="$ROOT/dist/ImageShield.app"

@@ -5,6 +5,9 @@ Set-Location $Root
 $env:PYINSTALLER_CONFIG_DIR = Join-Path $Root ".pyinstaller"
 
 python scripts/validate_bundle.py
+if ($LASTEXITCODE -ne 0) {
+    throw "Model files are missing. Download them before building."
+}
 python -m PyInstaller --noconfirm --clean ImageShield.spec
 
 $Executable = Join-Path $Root "dist\ImageShield\ImageShield.exe"
