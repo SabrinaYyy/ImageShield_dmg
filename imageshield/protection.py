@@ -13,6 +13,7 @@ import torch
 import torch.nn.functional as F
 from PIL import Image, ImageOps
 from torchvision import transforms
+import torchvision.transforms.functional as TF
 
 from .resources import resource_path
 
@@ -27,13 +28,12 @@ class ProtectionCancelled(RuntimeError):
 @dataclass(frozen=True)
 class ProtectionSettings:
     resolution: int = 512
-    eps: float = 0.05
+    eps: float = 0.03
     alpha: float = 1 / 255
     steps: int = 100
     seed: int = 33
-    eot_weight: float = 0.1
-    eot_kernel: int = 5
-    eot_sigma: float = 1.5
+    beta: float = 0.2        # perceptual consistency loss weight
+    eot_angle: float = 5.0   # rotation angle in degrees for EOT-R
 
     def validate(self) -> None:
         if self.resolution < 64:
@@ -44,10 +44,8 @@ class ProtectionSettings:
             raise ValueError("Epsilon must be between 0 and 1.")
         if self.alpha <= 0:
             raise ValueError("Alpha must be positive.")
-        if self.eot_kernel < 1 or self.eot_kernel % 2 == 0:
-            raise ValueError("The EOT kernel must be a positive odd number.")
-        if self.eot_sigma <= 0:
-            raise ValueError("The EOT sigma must be positive.")
+        if self.beta < 0:
+            raise ValueError("Beta must be non-negative.")
 
 
 def select_device() -> tuple[torch.device, torch.dtype]:
@@ -81,41 +79,43 @@ def make_preprocess(resolution: int):
     )
 
 
-def apply_gaussian_smoothing(
-    image: torch.Tensor,
-    kernel_size: int,
-    sigma: float,
-) -> torch.Tensor:
-    coordinates = (
-        torch.arange(kernel_size, dtype=torch.float32, device=image.device)
-        - kernel_size // 2
-    )
-    gaussian = torch.exp(-(coordinates**2) / (2 * sigma**2))
-    gaussian = gaussian / gaussian.sum()
-    kernel = gaussian.outer(gaussian).unsqueeze(0).unsqueeze(0)
-    kernel = kernel.to(image.device, image.dtype)
-    padding = kernel_size // 2
-    channels = [
-        F.conv2d(image[:, index : index + 1], kernel, padding=padding)
-        for index in range(image.shape[1])
-    ]
-    return torch.cat(channels, dim=1)
-
-
-def get_embedding(
+def get_emb(
     image: torch.Tensor,
     vae,
     scheduler,
     device: torch.device,
     dtype: torch.dtype,
-    fixed_noise: torch.Tensor,
-    fixed_timesteps: torch.Tensor,
 ) -> torch.Tensor:
+    """Stochastic VAE embedding — matches notebook get_emb() exactly."""
     image = image.to(device, dtype=dtype)
-    latent_mean = vae.encode(image).latent_dist.mean
-    latents = latent_mean * vae.config.scaling_factor
-    noisy_latents = scheduler.add_noise(latents, fixed_noise, fixed_timesteps)
-    return torch.cat([noisy_latents, latent_mean], dim=1)
+    latents = vae.encode(image).latent_dist.sample() * vae.config.scaling_factor
+    noise = torch.randn_like(latents)
+    bsz = latents.shape[0]
+    timesteps = torch.randint(
+        0, scheduler.config.num_train_timesteps, (bsz,), device=device
+    ).long()
+    noisy_latents = scheduler.add_noise(latents, noise, timesteps)
+    original_image_embeds = vae.encode(image).latent_dist.sample()
+    return torch.cat([noisy_latents, original_image_embeds], dim=1)
+
+
+def rotate_batch(x: torch.Tensor, angle: float) -> torch.Tensor:
+    """Rotate each image in the batch — differentiable.
+
+    grid_sampler_2d_backward is not yet implemented for MPS, so we perform the
+    rotation on CPU and transfer back.  Device transfers are differentiable,
+    so gradients flow through the round-trip correctly.
+    """
+    target_device = x.device
+    if target_device.type == "mps":
+        x = x.cpu()
+    rotated = torch.stack(
+        [
+            TF.rotate(x[i], angle, interpolation=transforms.InterpolationMode.BILINEAR)
+            for i in range(x.shape[0])
+        ]
+    )
+    return rotated.to(target_device)
 
 
 def derive_image_seed(base_seed: int, image: Image.Image) -> int:
@@ -137,91 +137,52 @@ def pgd_protect(
     cancelled: CancelCallback | None = None,
 ) -> torch.Tensor:
     original = original.to(device, dtype=dtype)
-    generator = torch.Generator(device="cpu")
-    generator.manual_seed(image_seed)
 
+    # Seed globally so init delta + stochastic get_emb calls are reproducible
+    torch.manual_seed(image_seed)
+
+    # Target embedding: unrotated original, computed once before the loop
     with torch.no_grad():
-        reference_latent = (
-            vae.encode(original).latent_dist.mean * vae.config.scaling_factor
-        )
+        tgt_emb = get_emb(original, vae, scheduler, device, dtype).detach()
 
-    fixed_noise = torch.randn(reference_latent.shape, generator=generator).to(
-        device, dtype=dtype
-    )
-    fixed_timesteps = torch.randint(
-        0,
-        scheduler.config.num_train_timesteps,
-        (reference_latent.shape[0],),
-        generator=generator,
-    ).to(device)
-    initial_delta = (
-        torch.rand(original.shape, generator=generator) * 2.0 - 1.0
-    ) * (settings.eps * 0.5)
-    initial_delta = initial_delta.to(device, dtype=dtype)
-
-    with torch.no_grad():
-        target_embedding = get_embedding(
-            original,
-            vae,
-            scheduler,
-            device,
-            dtype,
-            fixed_noise,
-            fixed_timesteps,
-        ).detach()
-        gaussian_reference = apply_gaussian_smoothing(
-            original,
-            settings.eot_kernel,
-            settings.eot_sigma,
-        ).detach()
-
-    protected = torch.clamp(original + initial_delta, 0.0, 1.0).detach()
+    # Random L∞ init — full budget, matching notebook
+    delta = (torch.rand(original.shape) * 2.0 - 1.0) * settings.eps
+    delta = delta.to(device, dtype=dtype)
+    delta = torch.clamp(delta, -settings.eps, settings.eps)
+    clipped = torch.clamp(original + delta, 0.0, 1.0)
+    delta = (clipped - original).detach()
 
     for step in range(settings.steps):
         if cancelled and cancelled():
             raise ProtectionCancelled("Protection stopped by the user.")
 
-        protected.requires_grad_(True)
-        embedding = get_embedding(
-            protected,
-            vae,
-            scheduler,
-            device,
-            dtype,
-            fixed_noise,
-            fixed_timesteps,
-        )
-        latent_loss = -F.mse_loss(embedding.float(), target_embedding.float())
-        eot_loss = (
-            F.mse_loss(
-                apply_gaussian_smoothing(
-                    protected,
-                    settings.eot_kernel,
-                    settings.eot_sigma,
-                ),
-                gaussian_reference,
-            )
-            if settings.eot_weight > 0
-            else torch.zeros((), device=device)
-        )
-        (latent_loss + settings.eot_weight * eot_loss).backward()
+        perturbed = torch.clamp(original + delta, 0.0, 1.0).detach().requires_grad_(True)
+
+        # EOT-R: rotation applied inside the embedding loss only
+        rotated = rotate_batch(perturbed, settings.eot_angle)
+        img_emb = get_emb(rotated, vae, scheduler, device, dtype)
+
+        real_mse = F.mse_loss(img_emb.float(), tgt_emb.float())
+        loss_percep = settings.beta * F.mse_loss(perturbed, original)
+        total_loss = -real_mse + loss_percep
+        total_loss.backward()
 
         with torch.no_grad():
-            protected = protected - settings.alpha * protected.grad.sign()
-            delta = torch.clamp(
-                protected - original,
-                -settings.eps,
-                settings.eps,
-            )
-            protected = torch.clamp(original + delta, 0.0, 1.0).detach()
+            delta = delta - settings.alpha * perturbed.grad.sign()
+            delta = torch.clamp(delta, -settings.eps, settings.eps)
+            clipped = torch.clamp(original + delta, 0.0, 1.0)
+            delta = (clipped - original).detach()
 
         if progress:
-            progress((step + 1) / settings.steps, f"Protection step {step + 1}/{settings.steps}")
+            progress(
+                (step + 1) / settings.steps,
+                f"Protection step {step + 1}/{settings.steps}",
+            )
 
     if cancelled and cancelled():
         raise ProtectionCancelled("Protection stopped by the user.")
 
-    return protected.cpu()
+    return torch.clamp(original + delta, 0.0, 1.0).cpu()
 
 
 def tensor_to_pil(tensor: torch.Tensor) -> Image.Image:
