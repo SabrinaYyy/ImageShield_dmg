@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import gc
 import threading
 from dataclasses import dataclass
 from pathlib import Path
@@ -28,7 +29,7 @@ class ProtectionCancelled(RuntimeError):
 @dataclass(frozen=True)
 class ProtectionSettings:
     resolution: int = 512
-    eps: float = 0.03
+    eps: float = 4/255
     alpha: float = 1 / 255
     steps: int = 100
     seed: int = 33
@@ -265,17 +266,22 @@ class ProtectionService:
 
         with self._protection_lock:
             self._cancel_event.clear()
-            protected = pgd_protect(
-                original,
-                self._vae,
-                self._scheduler,
-                self.device,
-                self.dtype,
-                run_settings,
-                image_seed,
-                progress,
-                self._cancel_event.is_set,
-            )
+            try:
+                protected = pgd_protect(
+                    original,
+                    self._vae,
+                    self._scheduler,
+                    self.device,
+                    self.dtype,
+                    run_settings,
+                    image_seed,
+                    progress,
+                    self._cancel_event.is_set,
+                )
+            finally:
+                if self.device.type == "mps" and hasattr(torch, "mps"):
+                    torch.mps.empty_cache()
+                gc.collect()
         return tensor_to_pil(protected)
 
     def cancel(self) -> None:
