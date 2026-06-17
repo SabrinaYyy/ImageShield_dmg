@@ -12,6 +12,7 @@ import uuid
 from pathlib import Path
 
 import gradio as gr
+from PIL import Image, ImageOps
 
 from .protection import (
     ProtectionCancelled,
@@ -38,6 +39,29 @@ def cleanup_old_outputs() -> None:
             continue
 
 
+def square_crop_image(image, resolution):
+    if image is None:
+        return None
+    size = int(resolution)
+    source = ImageOps.exif_transpose(image).convert("RGB")
+    return ImageOps.fit(
+        source,
+        (size, size),
+        method=Image.Resampling.LANCZOS,
+        centering=(0.5, 0.5),
+    )
+
+
+def store_original_image(image, resolution):
+    if image is None:
+        return None, None
+    return image.copy(), square_crop_image(image, resolution)
+
+
+def refresh_input_preview(original_image, resolution):
+    return square_crop_image(original_image, resolution)
+
+
 def prereq_gpu(image):
     """
     Before running the model, detect whether or not the current PC has a GPU to see if the computations can be done successfully.
@@ -49,23 +73,25 @@ def prereq_gpu(image):
     return gr.update(value=status, visible=True)
 
 
-def model(image, resolution, steps, progress=gr.Progress()):
+def model(original_image, resolution, pgd_eps, steps, progress=gr.Progress()):
     """
     The function is the root of the model function. The model acts as the image protector, given an image as an input, it will return the protected version
     of the image as an output. 
     """
-    if image is None:
+    if original_image is None:
         raise gr.Error("Please upload an image first.")
 
+    square_input = square_crop_image(original_image, resolution)
     settings = ProtectionSettings(
         resolution=int(resolution),
+        eps=float(pgd_eps),
         steps=int(steps),
     )
 
     try:
         progress(0, desc="Loading the offline protection model")
         protected_image = SERVICE.protect(
-            image,
+            square_input,
             settings=settings,
             progress=lambda value, description: progress(value, desc=description),
         )
@@ -203,6 +229,21 @@ where it's black in the mask, the dark overlay becomes see-through.
 # ---------------------------------------------------------------------------
 ALL_JS = """
 () => {
+    function hideUseViaApi() {
+        document.querySelectorAll('a, button').forEach(function(el) {
+            if (!el.textContent || el.textContent.indexOf('Use via API') === -1) return;
+            el.style.setProperty('display', 'none', 'important');
+            var next = el.nextSibling;
+            if (next && next.nodeType === Node.TEXT_NODE) {
+                next.textContent = next.textContent.replace(/^\\s*[·•]\\s*/, ' ');
+            } else if (next && next.textContent && /^[\\s·•]+$/.test(next.textContent)) {
+                next.style && next.style.setProperty('display', 'none', 'important');
+            }
+        });
+    }
+    hideUseViaApi();
+    new MutationObserver(hideUseViaApi).observe(document.body, {childList: true, subtree: true});
+
     // ── Page navigation ─────────────────────────────────────────────────────
     // Toggles display: block / none on #page-main and #page-about to simulate a two-page app within a single Gradio page.
     // Updates the nav link styles (blue underline = active page).
@@ -463,6 +504,7 @@ with gr.Blocks() as demo:
     # Link the HTMl files with the Gradio app demo
     gr.HTML(NAV_HTML)
     gr.HTML(TOUR_HTML)
+    original_image_state = gr.State(value=None)
 
     # ── Main page ────────────────────────────────────────────────────────────
     with gr.Column(elem_id="page-main"):
@@ -484,6 +526,14 @@ with gr.Blocks() as demo:
                     value=256,
                     label="Output Resolution",
                     info="Lower resolutions process faster.",
+                )
+                pgd_eps = gr.Slider(
+                    minimum=4 / 255,
+                    maximum=0.05,
+                    value=4 / 255,
+                    step=0.001,
+                    label="Protection Strength",
+                    info="Lower values preserve image quality; higher values improve robustness.",
                 )
                 steps = gr.Slider(
                     minimum=20,
@@ -514,15 +564,30 @@ with gr.Blocks() as demo:
                 output_file = gr.DownloadButton(label="Download Protected Image", variant="primary",
                                       visible=False, elem_id="download_section", elem_classes="download_section")
 
+        input_image.upload(
+            fn=store_original_image,
+            inputs=[input_image, resolution],
+            outputs=[original_image_state, input_image],
+        )
+        input_image.clear(
+            fn=lambda: (None, None),
+            outputs=[original_image_state, input_image],
+        )
+        resolution.change(
+            fn=refresh_input_preview,
+            inputs=[original_image_state, resolution],
+            outputs=input_image,
+        )
+
         # Create function for the protect image button, run the prereq to check gpu requirements, and then run model function
         prerequisite_event = protect_btn.click(
             fn=prereq_gpu, 
-            inputs=input_image, 
+            inputs=original_image_state, 
             outputs=text_output
         )
         protection_event = prerequisite_event.success(
             fn=model,
-            inputs=[input_image, resolution, steps],
+            inputs=[original_image_state, resolution, pgd_eps, steps],
             outputs=[output_image, output_file],
         )
         stop_btn.click(
